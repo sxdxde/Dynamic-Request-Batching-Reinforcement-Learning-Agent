@@ -1,0 +1,9 @@
+# Python runtime
+__pycache__/
+*.pyc
+
+# Local project outputs (optional to ignore, but usually recommended)
+models/
+tensorboard_logs/
+monitor_logs/
+.DS_Store
