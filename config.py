@@ -23,6 +23,65 @@ CONFIG = {
     "offpeak_multiplier": 0.5,   # Lambda multiplier during off-peak hours
 }
 
+# ───────────────────────────────────────────────────────────────────────────
+# DQN Hyperparameters
+# Compare directly against PPO_KWARGS in agent/train.py
+# ───────────────────────────────────────────────────────────────────────────
+
+DQN_CONFIG = {
+    # Learning
+    "learning_rate": 1e-4,         # DQN is more sensitive to LR than PPO
+    "gamma": 0.99,                 # Discount factor — same as PPO for fair comparison
+    "batch_size": 64,              # Minibatch size for Q-network updates — same as PPO
+
+    # Replay buffer
+    "buffer_size": 100_000,        # How many past (s,a,r,s') transitions to store
+                                   # Key DQN innovation — breaks temporal correlations
+    "learning_starts": 10_000,     # Steps of random action BEFORE learning begins
+                                   # Fills the replay buffer with diverse data first
+
+    # Target network
+    "target_update_interval": 1000, # Every N steps, copy Q-network → Target Q-network
+                                    # Prevents the Q-value target from "chasing itself"
+                                    # (main stability trick of DQN vs vanilla Q-learning)
+    "tau": 1.0,                    # 1.0 = hard update (copy weights completely)
+                                   # <1.0 = soft/polyak update (blend weights gradually)
+
+    # Exploration (ε-greedy)
+    "exploration_fraction": 0.2,   # Fraction of training spent decaying ε
+    "exploration_initial_eps": 1.0, # Start fully random (100% explore)
+    "exploration_final_eps": 0.05,  # End at 5% random exploration
+
+    # Network
+    "net_arch": [64, 64],          # Same hidden layer size as PPO for fair comparison
+
+    # Training
+    "train_freq": 4,               # Train the Q-network every N environment steps
+    "gradient_steps": 1,           # Gradient update steps per training call
+
+    # Logging
+    "verbose": 1,
+    "tensorboard_log": "tensorboard_logs/",
+}
+
+
+RPPO_CONFIG = {
+    "learning_rate": 3e-4,
+    "gamma": 0.99, 
+    "gae_lambda": 0.95,
+    "clip_range": 0.2,
+    "ent_coef": 0.01,
+    "vf_coef": 0.5,
+    "max_grad_norm": 0.5,
+
+    "lstm_hidden_size": 64,
+    "n_lstm_layers": 1,
+    "enable_critic_lstm":True,
+    "n_steps": 128,
+    "batch_size": 64,
+    "n_epochs":10,
+    "net_arch": dict(pi=[64], vf=[64]),
+}
 
 # ───────────────────────────────────────────────────────────────────────────
 # Experiment presets — change one key to explore different traffic regimes.

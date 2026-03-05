@@ -30,7 +30,8 @@ matplotlib.use("Agg")  # headless; works in any environment
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from matplotlib.ticker import MultipleLocator
-from stable_baselines3 import PPO
+from stable_baselines3 import PPO, DQN
+from sb3_contrib import RecurrentPPO
 
 from env.batching_env import BatchingEnv
 from baselines.cloudflare_formula import CloudflareBaseline, evaluate_baseline
@@ -57,11 +58,13 @@ SPINE_COLOR= "#2a3450"
 
 AGENT_COLORS = {
     "PPO":        "#00e5ff",   # cyan
+    "DQN":        "#76ff03",   # lime green
+    "RPPO":       "#e040fb",   # magenta
     "Greedy":     "#7c4dff",   # purple
     "Cloudflare": "#ff6f00",   # amber
     "Random":     "#f44336",   # red
 }
-AGENT_ORDER = ["PPO", "Greedy", "Cloudflare", "Random"]
+AGENT_ORDER = ["PPO", "DQN", "RPPO", "Greedy", "Cloudflare", "Random"]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -75,6 +78,71 @@ class PPOWrapper:
 
     def predict(self, obs: np.ndarray) -> int:
         action, _ = self.model.predict(obs, deterministic=True)
+        return int(action)
+
+class DQNWrapper:
+    """Thin wrapper so DQN has the same predict(obs)->int interface as baselines.
+
+    DQN's predict() is the same signature as PPO's, but internally it is doing
+    something fundamentally different: it computes Q(s, a) for all actions and
+    returns argmax. When deterministic=True, it always picks the greedy action.
+    When deterministic=False, it uses ε-greedy during training.
+    """
+    def __init__(self, model):
+        self.model = model
+
+    def predict(self, obs: np.ndarray) -> int:
+        action, _ = self.model.predict(obs, deterministic=True)
+        return int(action)
+
+class RecurrentPPOWrapper:
+    """Wrapper for RecurrentPPO that correctly manages LSTM hidden states.
+
+    This wrapper is fundamentally different from PPOWrapper and DQNWrapper.
+    Standard feedforward models have a stateless predict() — you just pass
+    the observation and get an action.
+
+    RecurrentPPO is stateful: it requires you to track and pass the LSTM
+    hidden state (lstm_states) between consecutive steps within the same
+    episode, and explicitly tell it when a new episode begins
+    (episode_start=True) so it can reset the hidden state to zeros.
+
+    If you forget to pass lstm_states forward, the LSTM resets to zero at
+    every step — equivalent to a memoryless policy, completely defeating
+    the purpose of the recurrent architecture.
+
+    If you forget to reset lstm_states at episode boundaries, the LSTM
+    carries over stale memory from the previous episode into the new one,
+    causing incorrect, context-polluted predictions.
+
+    This wrapper handles all of that correctly so the evaluation loop in
+    collect_episode_data() does not need to change at all.
+    """
+
+    def __init__(self, model: RecurrentPPO):
+        self.model = model
+        self.lstm_states = None        # Tuple of (h_t, c_t) — starts as None
+        self.episode_started = True    # True at first step → resets LSTM to 0
+
+    def reset(self):
+        """Call this at the start of each new evaluation episode."""
+        self.lstm_states = None
+        self.episode_started = True
+
+    def predict(self, obs: np.ndarray) -> int:
+        """Predict action, carrying LSTM state forward between calls."""
+        import numpy as np_inner
+
+        # episode_starts shape must match n_envs — here n_envs=1 for eval.
+        ep_start = np_inner.array([self.episode_started], dtype=bool)
+
+        action, self.lstm_states = self.model.predict(
+            obs,
+            state=self.lstm_states,
+            episode_start=ep_start,
+            deterministic=True,
+        )
+        self.episode_started = False   # Subsequent steps in same episode
         return int(action)
 
 
@@ -97,6 +165,9 @@ def collect_episode_data(agent, env, n_episodes: int, seed_offset: int) -> dict:
         total_reward = 0.0
         terminated = truncated = False
         prev_served = 0
+
+        if hasattr(agent, "reset"):
+            agent.reset()
 
         # track queue snapshot before each serve
         while not (terminated or truncated):
@@ -128,8 +199,32 @@ def run_all_agents(model_path: str) -> dict[str, dict]:
     env = BatchingEnv()
 
     # Build agents
+    # --- Resolve DQN model path ---
+    dqn_best  = os.path.join(ROOT, "models", "dqn_best", "best_model")
+    dqn_final = os.path.join(ROOT, "models", "dqn_batching_final")
+    if os.path.exists(dqn_best + ".zip") or os.path.exists(dqn_best):
+        dqn_path = dqn_best
+    elif os.path.exists(dqn_final + ".zip") or os.path.exists(dqn_final):
+        dqn_path = dqn_final
+    else:
+        dqn_path = None
+        print("  [WARN] DQN model not found — run agent/train_dqn.py first.")
+
+     # --- Resolve RPPO model path ---
+    rppo_best  = os.path.join(ROOT, "models", "rppo_best", "best_model")
+    rppo_final = os.path.join(ROOT, "models", "rppo_batching_final")
+    if os.path.exists(rppo_best + ".zip") or os.path.exists(rppo_best):
+        rppo_path = rppo_best
+    elif os.path.exists(rppo_final + ".zip") or os.path.exists(rppo_final):
+        rppo_path = rppo_final
+    else:
+        rppo_path = None
+        print("  [WARN] RPPO model not found — run agent/train_rppo.py first.")
+
     agents = {
         "PPO":        PPOWrapper(PPO.load(model_path, env=env)),
+        "RPPO":       RecurrentPPOWrapper(RecurrentPPO.load(rppo_path, env=env)) if rppo_path else RandomAgent(seed=1),
+        "DQN":        DQNWrapper(DQN.load(dqn_path, env=env)) if dqn_path else RandomAgent(seed=0),
         "Greedy":     GreedyAgent(),
         "Cloudflare": CloudflareBaseline(
                           max_latency_ms=CONFIG["max_latency_ms"], seed=42),
