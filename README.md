@@ -1,4 +1,4 @@
-# Dynamic Request Batching — Reinforcement Learning Agent
+# Dynamic Request Batching — Reinforcement Learning Project
 
 A PPO (Proximal Policy Optimization) agent that learns *when* to dispatch queued inference requests to a GPU backend.  Every 10 ms the agent observes the current queue state and decides to **Wait** (keep accumulating) or **Serve** (dispatch the batch now), optimising the trade-off between GPU efficiency (large batches) and SLA compliance (low latency).
 
