@@ -1,0 +1,480 @@
+\documentclass[11pt,a4paper]{article}
+
+% ── Packages ───────────────────────────────────────────────────────────────────
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{tikz}
+\usetikzlibrary{shapes.geometric, arrows.meta, positioning}
+\usepackage{hyperref}
+\usepackage{microtype}
+\usepackage{enumitem}
+\usepackage{fancyhdr}
+\usepackage{titlesec}
+% ── Colors ─────────────────────────────────────────────────────────────────────
+\definecolor{ppoBlue}{RGB}{41,128,185}
+\definecolor{cfOrange}{RGB}{211,84,0}
+\definecolor{darkGray}{RGB}{44,62,80}
+\definecolor{lightBg}{RGB}{245,247,250}
+\definecolor{accentRed}{RGB}{192,57,43}
+\definecolor{green}{RGB}{39,174,96}
+
+% ── Section styling ────────────────────────────────────────────────────────────
+\titleformat{\section}{\large\bfseries\color{darkGray}}{§\thesection}{0.8em}{}[{\color{ppoBlue}\titlerule[0.8pt]}]
+\titleformat{\subsection}{\normalsize\bfseries\color{ppoBlue}}{\thesubsection}{0.6em}{}
+
+% ── Header / footer ───────────────────────────────────────────────────────────
+\pagestyle{fancy}
+\fancyhf{}
+\lhead{\small\textbf{RL Dynamic Request Batching} — Project Guide}
+\rhead{\small Sudarshan Sudhakar, May 2026}
+\cfoot{\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+
+% ── Code listings ──────────────────────────────────────────────────────────────
+\lstset{
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{ppoBlue}\bfseries,
+  commentstyle=\color{gray}\itshape,
+  stringstyle=\color{accentRed},
+  backgroundcolor=\color{lightBg},
+  frame=single, framerule=0.4pt,
+  rulecolor=\color{ppoBlue!40},
+  breaklines=true,
+  numbers=none,
+  xleftmargin=6pt, xrightmargin=6pt,
+}
+
+% ── Highlight boxes ────────────────────────────────────────────────────────────
+\newmdenv[
+  backgroundcolor=ppoBlue!8,
+  linecolor=ppoBlue,
+  linewidth=1pt,
+  roundcorner=4pt,
+  innertopmargin=6pt, innerbottommargin=6pt,
+  innerleftmargin=8pt, innerrightmargin=8pt,
+]{infobox}
+
+\newmdenv[
+  backgroundcolor=cfOrange!8,
+  linecolor=cfOrange,
+  linewidth=1pt,
+  roundcorner=4pt,
+  innertopmargin=6pt, innerbottommargin=6pt,
+  innerleftmargin=8pt, innerrightmargin=8pt,
+]{warnbox}
+
+% ── Hyperref ──────────────────────────────────────────────────────────────────
+\hypersetup{colorlinks=true, linkcolor=ppoBlue, urlcolor=ppoBlue}
+
+% ══════════════════════════════════════════════════════════════════════════════
+\begin{document}
+% ══════════════════════════════════════════════════════════════════════════════
+
+% ── Title ──────────────────────────────────────────────────────────────────────
+\begin{center}
+  {\LARGE\bfseries\color{darkGray}%
+   RL-Based Dynamic Request Batching\\[4pt]
+   \large on GPU Inference Servers}\\[8pt]
+  {\large Sudarshan Sudhakar \quad \texttt{sudarshansudhakar@gmail.com}}\\[4pt]
+  {\normalsize Semester 6 Reinforcement Learning Project $\;\cdot\;$ May 2026}
+  \vspace{8pt}
+  \hrule height 1.4pt
+\end{center}
+
+\vspace{4pt}
+\begin{infobox}
+\textbf{One-sentence summary.}\; A PPO agent learns \emph{when} to dispatch
+queued inference requests to a GPU backend, outperforming the production
+Cloudflare dual-threshold heuristic by adapting dispatch timing dynamically
+to queue depth, urgency, EMA arrival rate, and time-of-day.
+\end{infobox}
+\vspace{8pt}
+
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Problem}
+% ══════════════════════════════════════════════════════════════════════════════
+
+A GPU inference node receives requests at \textbf{2\,000 req/s} (peak 5\,000).
+Every \textbf{10\,ms} a batching layer decides to \emph{Wait} or \emph{Serve}.
+
+\medskip
+\renewcommand{\arraystretch}{1.25}
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Decision} & \textbf{Effect} & \textbf{Problem} \\
+\midrule
+Serve too early & tiny batch & wasted GPU kernel launch, poor utilisation \\
+Wait too long   & large batch & high latency, SLA violations \\
+Optimal         & adaptive    & threshold depends on rate, age, time-of-day \\
+\bottomrule
+\end{tabular}
+
+\medskip
+The SLA constraint is on \emph{total client-perceived latency}:
+\begin{equation}
+  \text{total latency} = \underbrace{w_i}_{\text{queue wait}} +
+  \underbrace{t_\text{proc}(n)}_{\text{GPU time}}
+  = w_i + 8 + 0.12\,n \;\text{ms}
+  \;\leq\; 500\;\text{ms}
+  \label{eq:sla}
+\end{equation}
+No closed-form optimal policy exists; fixed thresholds cannot adapt to
+time-varying traffic. This motivates a learned policy.
+
+% ══════════════════════════════════════════════════════════════════════════════
+\section{MDP Formulation}
+% ══════════════════════════════════════════════════════════════════════════════
+
+\subsection{State Space — 8-dimensional continuous}
+
+\begin{tabular}{@{}clll@{}}
+\toprule
+\textbf{Dim} & \textbf{Feature} & \textbf{Range} & \textbf{Role} \\
+\midrule
+0 & \texttt{pending\_requests} & $[0, 512]$      & Queue depth \\
+1 & \texttt{oldest\_wait\_ms}  & $[0, 1000]$     & Head-of-queue age \\
+2 & \texttt{request\_rate}     & $[0, 25\,000]$  & EMA arrival rate (req/s) \\
+3 & \texttt{since\_serve\_ms}  & $[0, 1000]$     & Time since last dispatch \\
+4 & \texttt{batch\_fill\_ratio}& $[0, 1]$        & \texttt{pending / max\_batch} \\
+5 & \texttt{time\_of\_day}     & $[0, 24)$       & Fractional hour \\
+6 & \texttt{urgency\_ratio}    & $[0, 3]$        & $w_\max / (\text{SLA} - t_\text{proc}(n))$ \\
+7 & \texttt{rate\_trend}       & $[-1, 1]$       & Fractional EMA change per step \\
+\bottomrule
+\end{tabular}
+
+\medskip
+\noindent\textbf{Key design choices:}
+\begin{itemize}[noitemsep]
+  \item \textbf{\texttt{urgency\_ratio}}: when $>1.0$, the current batch
+        \emph{will} violate SLA even if served now — gives the agent pre-emptive
+        signal before violations occur.
+  \item \textbf{\texttt{rate\_trend}}: detects incoming traffic spikes before
+        the EMA fully adapts, enabling proactive dispatch.
+  \item \textbf{EMA} smooths the instantaneous rate with $\alpha=0.1$ per 10\,ms step.
+\end{itemize}
+
+\subsection{Action Space}
+
+$\mathcal{A} = \{0\;\text{(Wait)},\;1\;\text{(Serve)}\}$ — binary, Discrete(2).
+
+\subsection{Reward Function}
+
+\textbf{Serve} ($a=1$):
+\begin{equation}
+  r = \alpha\,n - \beta\,w_\max - c_\text{dispatch} -
+  \lambda \sum_{i=1}^{n} \max\!\left(0,\; w_i + t_\text{proc}(n) - \text{SLA}\right)
+\end{equation}
+
+\textbf{Wait} ($a=0$):
+\begin{equation}
+  r = -\beta\,w_\max - \mathbf{1}_{n=0}\,c_\text{idle}
+\end{equation}
+
+\medskip
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Symbol} & \textbf{Value} & \textbf{Symbol} & \textbf{Value} \\
+\midrule
+$\alpha$ (revenue/req) & 1.0 & $c_\text{dispatch}$ (GPU overhead) & 5.0 \\
+$\beta$ (urgency weight) & 0.003 & $\lambda$ (SLA penalty/ms) & 0.3 \\
+$c_\text{idle}$ (empty queue) & 0.5 & & \\
+\bottomrule
+\end{tabular}
+
+\medskip
+\begin{warnbox}
+\textbf{Critical.} $c_\text{dispatch} = 5.0$ means serving a batch of fewer than
+5 requests is unprofitable ($\alpha n < c$). This single hyperparameter drives
+batch accumulation and was tuned empirically.
+\end{warnbox}
+
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Algorithms}
+% ══════════════════════════════════════════════════════════════════════════════
+
+\subsection{PPO — Proximal Policy Optimization (Primary)}
+
+On-policy actor-critic using the clipped surrogate objective:
+\begin{equation}
+  L^\text{CLIP} = \mathbb{E}_t\!\left[
+    \min\!\left(r_t(\theta)\,\hat{A}_t,\;
+    \text{clip}(r_t(\theta), 1{-}\epsilon, 1{+}\epsilon)\,\hat{A}_t
+    \right)
+  \right], \quad \epsilon = 0.2
+\end{equation}
+where $r_t(\theta) = \pi_\theta(a_t|s_t) / \pi_{\theta_\text{old}}(a_t|s_t)$.
+Advantages are estimated via GAE ($\lambda=0.95$).
+
+\medskip
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Hyperparameter} & \textbf{Value} & \textbf{Hyperparameter} & \textbf{Value} \\
+\midrule
+Learning rate & $3\times10^{-4}$ & Entropy coefficient & 0.005 \\
+$n_\text{steps}$ & 2\,048 & GAE $\lambda$ & 0.95 \\
+Minibatch size & 256 & Discount $\gamma$ & 0.99 \\
+Gradient epochs & 10 & Architecture & MLP $[128,128]$ \\
+Parallel envs & 4 & Total timesteps & 1\,000\,000 \\
+\bottomrule
+\end{tabular}
+
+\subsection{D3QN — Dueling Double DQN + Prioritized Replay}
+
+Combines three improvements over vanilla DQN:
+\begin{enumerate}[noitemsep]
+  \item \textbf{Dueling streams}: $Q(s,a) = V(s) + A(s,a) - \frac{1}{|\mathcal{A}|}\sum_{a'}A(s,a')$
+  \item \textbf{Double DQN}: action selected by online network, evaluated by target
+        network — removes overestimation bias
+  \item \textbf{PER}: sample probability $p_i \propto |\delta_i|^\alpha$
+        ($\alpha=0.6$), IS-corrected with $\beta$: $0.4\to1.0$
+\end{enumerate}
+Additionally uses \textbf{3-step returns} to propagate signal across the
+wait$\to$accumulate$\to$serve cycle.
+
+\subsection{Discrete SAC}
+
+Maximum-entropy framework with automatic temperature tuning.
+Target entropy $H^* = 0.5\ln(2) \approx 0.347$ nats.
+Soft Q-function updates with $\tau=0.005$ target smoothing.
+Reward scaled by $10^{-3}$ to keep Q-values in $[3,5]$.
+
+\subsection{Recurrent PPO (Ablation)}
+
+PPO augmented with an LSTM layer before policy and value heads.
+Handles temporal correlations explicitly but requires stateful
+inference and $\sim$2$\times$ more training time.
+Used to verify that the MLP's EMA-based features are sufficient.
+
+\medskip
+\begin{infobox}
+\textbf{Why PPO wins.}
+The 8 state features already encode sufficient history (EMA rate, rate trend,
+since-serve, oldest-wait). An explicit LSTM is unnecessary. PPO trains in
+$\sim$25\,min on CPU, produces a stateless policy, and deploys with a
+single \texttt{predict()} call.
+\end{infobox}
+
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Baselines}
+% ══════════════════════════════════════════════════════════════════════════════
+
+\subsection{Cloudflare Dual-Threshold (Competitive)}
+
+The actual production heuristic used by Cloudflare AI Gateway, NVIDIA Triton,
+and vLLM:
+\begin{alignat}{2}
+  \text{SERVE}&\;\text{ if }\; w_\max &\;\geq\;& 0.80 \times (\text{SLA} - t_\text{proc}(n))
+    \quad\text{[latency urgency]}\\
+  \text{SERVE}&\;\text{ if }\; n      &\;\geq\;& \lfloor\text{rate} \times 0.050\rfloor
+    \quad\text{[batch efficiency]}
+\end{alignat}
+At 2\,000 req/s: batch target = 100. At 5\,000 req/s: target = 250.
+\emph{Adaptive to load but blind to rate trajectory, time-of-day, and
+inter-serve interval.}
+
+\subsection{GreedyBatch (Floor)}
+
+Serves whenever $n \geq 8$. Minimises latency but maximises dispatch overhead
+and wastes GPU capacity — provides a lower bound on efficiency.
+
+\begin{warnbox}
+\textbf{Why the textbook $e^{-\lambda t}$ formula was discarded.}
+At $\lambda=2000$ req/s and SLA = 0.5\,s: $e^{-2000 \times 0.5} \approx 0$.
+The agent never dispatches, violates every SLA, and scores $-6000+$ per episode.
+The formula is designed for web batching at $\lambda \approx 1$--10 req/s and
+does not transfer to inference serving.
+\end{warnbox}
+
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Implementation Details}
+% ══════════════════════════════════════════════════════════════════════════════
+
+\subsection{Environment (\texttt{env/batching\_env.py})}
+
+\begin{itemize}[noitemsep]
+  \item \textbf{Traffic generator}: Poisson arrivals with time-of-day multipliers
+        ($\times2.5$ peak hours 9--23, $\times0.2$ off-peak). Each episode
+        samples a random start hour from $[0,24)$.
+  \item \textbf{Queue}: Python list of arrival timestamps; capped at 512 entries.
+        Overflow sheds \emph{new} arrivals (oldest requests preserved for SLA reasons).
+  \item \textbf{GPU model}: $t(n) = 8.0 + 0.12n$ ms. Linear fit to NVIDIA Triton
+        benchmarks on an A10G (batch=1: 8.1\,ms; batch=256: 38.7\,ms).
+  \item \textbf{Metrics}: P50/P95/P99 total latency and SLA violation rate
+        accumulated per episode and returned in \texttt{info}.
+\end{itemize}
+
+\subsection{Training (\texttt{agent/train.py})}
+
+\begin{lstlisting}[language=Python]
+env = make_vec_env(BatchingEnv, n_envs=4, vec_env_cls=SubprocVecEnv)
+env = VecNormalize(env, norm_obs=True, norm_reward=False)
+
+model = PPO("MlpPolicy", env,
+            learning_rate=3e-4, n_steps=2048, batch_size=256,
+            n_epochs=10, gamma=0.99, gae_lambda=0.95,
+            clip_range=0.2, ent_coef=0.005,
+            policy_kwargs={"net_arch": [128, 128]})
+
+model.learn(total_timesteps=1_000_000,
+            callback=EvalCallback(eval_env, best_model_save_path="models/best",
+                                  eval_freq=20_000, n_eval_episodes=10))
+model.save("models/ppo_final")
+env.save("models/ppo_vecnorm.pkl")
+\end{lstlisting}
+
+\subsection{Deployment (\texttt{deploy/middleware.py})}
+
+\begin{lstlisting}[language=Python]
+from deploy.middleware import BatchingMiddleware
+
+mw = BatchingMiddleware(
+    model_path   = "models/ppo_final",
+    vecnorm_path = "models/ppo_vecnorm.pkl",
+)
+
+# Called every 10 ms
+if mw.should_dispatch():
+    batch = mw.flush()
+    inference_backend.process(batch)
+\end{lstlisting}
+
+\begin{warnbox}
+\textbf{Critical}: \texttt{ppo\_final.zip} and \texttt{ppo\_vecnorm.pkl} store
+running normalization statistics jointly with the policy. Always regenerate
+\emph{both} files when retraining. Using stale VecNormalize stats with new
+weights produces silently incorrect predictions.
+\end{warnbox}
+
+% ══════════════════════════════════════════════════════════════════════════════
+\section{File Structure}
+% ══════════════════════════════════════════════════════════════════════════════
+
+\begin{lstlisting}
+config.py                  Central config: env, GPU model, PPO/D3QN/SAC params
+env/
+  batching_env.py          Gymnasium env (8-dim state, Poisson traffic, rewards)
+  traffic_generator.py     Time-of-day Poisson arrival generator
+baselines/
+  cloudflare_formula.py    Cloudflare dual-threshold + GreedyBatch
+agent/
+  train.py                 PPO training (VecNormalize, 4 envs, 1M steps)
+  train_d3qn.py            D3QN training (PER, dueling, 3-step returns)
+  train_sac.py             Discrete SAC training
+  d3qn.py                  D3QN network architecture
+  discrete_sac.py          Discrete SAC implementation
+  evaluate.py              3-agent comparison, generates plots
+deploy/
+  middleware.py            Production class: loads model + VecNorm stats
+models/
+  ppo_final.zip            Trained PPO weights
+  ppo_vecnorm.pkl          VecNormalize statistics (deploy alongside ppo_final)
+  best/best_model.zip      Best checkpoint by eval reward
+results/
+  comparison.png           6-panel comparison figure
+  decision_heatmap.png     PPO P(Serve) heatmap with Cloudflare overlay
+tensorboard_logs/          TensorBoard training curves
+\end{lstlisting}
+
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Quick-Start Commands}
+% ══════════════════════════════════════════════════════════════════════════════
+
+\begin{lstlisting}[language=bash]
+# Install dependencies
+pip install "stable-baselines3[extra]" gymnasium scipy matplotlib numpy
+
+# Sanity check: validate env + run baseline eval
+python3 test_baselines.py
+
+# Train PPO (~20-40 min on CPU)
+python3 agent/train.py
+
+# Monitor training (open localhost:6006)
+tensorboard --logdir tensorboard_logs/
+
+# Evaluate all agents and generate plots
+python3 agent/evaluate.py
+# outputs: results/comparison.png, results/decision_heatmap.png
+
+# Evaluate using best checkpoint (not final)
+python3 agent/evaluate.py --model models/best/best_model
+
+# Smoke-test deployment middleware
+python3 deploy/middleware.py
+\end{lstlisting}
+
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Evaluation Metrics and Interpretation}
+% ══════════════════════════════════════════════════════════════════════════════
+
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Metric} & \textbf{Higher/Lower is better} & \textbf{What it measures} \\
+\midrule
+Mean episode reward & Higher & Throughput $-$ latency cost $-$ SLA penalties \\
+P50 total latency & Lower & Typical client experience \\
+P95/P99 total latency & Lower & Tail latency (SLA-relevant) \\
+SLA violation rate & Lower & Fraction of requests $>$ 500\,ms \\
+Mean batch size & Higher (to a point) & GPU utilisation \\
+\bottomrule
+\end{tabular}
+
+\medskip
+\noindent\textbf{What to look for:}
+\begin{enumerate}[noitemsep]
+  \item PPO reward should exceed Cloudflare by 10--25\% — meaningful but not
+        implausible. If much higher, check for reward shaping bugs.
+  \item Decision heatmap: PPO boundary should be \emph{curved} (non-linear);
+        Cloudflare shows two straight threshold lines.
+  \item GreedyBatch: lowest P99 latency but lowest reward due to tiny batches.
+\end{enumerate}
+
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Experiment Presets (Eval Only)}
+% ══════════════════════════════════════════════════════════════════════════════
+
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Preset} & \textbf{Rate} & \textbf{Peak mult.} & \textbf{Use case} \\
+\midrule
+\texttt{off\_peak}    & 400 req/s   & 1.5$\times$ & Overnight, minimal load \\
+\texttt{standard}     & 2\,000 req/s & 2.5$\times$ & Training distribution \\
+\texttt{peak\_load}   & 5\,000 req/s & 3.0$\times$ & Business hours stress test \\
+\texttt{viral\_spike} & 20\,000 req/s & —          & Burst / DDoS scenario \\
+\bottomrule
+\end{tabular}
+
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Limitations \& Future Work}
+% ══════════════════════════════════════════════════════════════════════════════
+
+\begin{itemize}[noitemsep]
+  \item \textbf{Simulated GPU model}: $t(n) = 8 + 0.12n$ is a linear fit;
+        real GPU throughput is non-linear (memory-bandwidth saturation effects
+        at large batches, kernel fusion at medium batches).
+  \item \textbf{Single node}: does not handle multi-replica load balancing or
+        heterogeneous GPU tiers.
+  \item \textbf{Homogeneous requests}: ignores variable request complexity
+        (e.g., different sequence lengths in LLM inference).
+  \item \textbf{Online adaptation}: the deployed model does not fine-tune on
+        production traffic; distribution shift may degrade performance over time.
+  \item \textbf{Next steps}: real Triton profiling data for GPU model;
+        multi-node coordination; heterogeneous SLA tiers; online RL from
+        production feedback.
+\end{itemize}
+
+\vspace{10pt}
+\hrule height 0.8pt
+\vspace{4pt}
+\begin{center}
+  \small\textit{Project repo:}
+  \texttt{/Desktop/Semester\,6/Rl\,project\,gooooo/}\quad
+  \textit{Model artifacts:} \texttt{models/ppo\_final.zip} +
+  \texttt{models/ppo\_vecnorm.pkl}
+\end{center}
+
+\end{document}
